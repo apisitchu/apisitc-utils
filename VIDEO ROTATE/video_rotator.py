@@ -37,7 +37,11 @@ ROTATE_MAP = {
     "right": "transpose=1",
     "left": "transpose=2",
     "180": "transpose=1,transpose=1",
+    "resize": None,
 }
+
+
+COLOR_ENHANCE_FILTER = "eq=contrast=1.03:brightness=0.03:saturation=1.18:gamma=1.06"
 
 
 @dataclass
@@ -71,8 +75,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--direction",
-        choices=["right", "left", "180"],
-        help="Rotation direction: right, left, or 180.",
+        choices=["right", "left", "180", "resize"],
+        help="Rotation direction: right, left, 180, or resize.",
     )
     parser.add_argument(
         "--workers",
@@ -111,6 +115,11 @@ def parse_args() -> argparse.Namespace:
         help="Custom path to ffmpeg executable (optional).",
     )
     parser.add_argument(
+        "--enhance-color",
+        action="store_true",
+        help="Apply a mild color-enhancement filter to exported videos.",
+    )
+    parser.add_argument(
         "--gui",
         action="store_true",
         help="Launch desktop UI.",
@@ -133,16 +142,20 @@ def prompt_for_missing(args: argparse.Namespace) -> argparse.Namespace:
         print("1) right (90° clockwise)")
         print("2) left  (90° counter-clockwise)")
         print("3) 180")
-        mapping = {"1": "right", "2": "left", "3": "180"}
+        print("4) resize (ไม่หมุน / ย่อไฟล์)")
+        mapping = {"1": "right", "2": "left", "3": "180", "4": "resize"}
         while True:
-            choice = input("Direction [1/2/3]: ").strip()
+            choice = input("Direction [1/2/3/4]: ").strip()
             if choice in mapping:
                 args.direction = mapping[choice]
                 break
-            print("Invalid choice. Please enter 1, 2, or 3.")
+            print("Invalid choice. Please enter 1, 2, 3, or 4.")
 
     if args.output is None:
-        args.output = args.input / f"rotated_{args.direction}"
+        if args.direction == "resize":
+            args.output = args.input / f"rotated_resize{time.strftime('%Y%m%d%H%M')}"
+        else:
+            args.output = args.input / f"rotated_{args.direction}"
 
     return args
 
@@ -161,10 +174,30 @@ def list_videos(input_dir: Path, recursive: bool) -> List[Path]:
 
 def build_output_path(src: Path, input_dir: Path, output_dir: Path, direction: str) -> Path:
     relative_path = src.relative_to(input_dir)
-    new_name = f"{relative_path.stem}_rotation_{direction}{relative_path.suffix}"
+    if direction == "resize":
+        new_name = f"{relative_path.stem}_resize.MP4"
+    else:
+        new_name = f"{relative_path.stem}_rotation_{direction}{relative_path.suffix}"
     output_path = output_dir / relative_path.parent / new_name
     output_path.parent.mkdir(parents=True, exist_ok=True)
     return output_path
+
+
+def build_video_filter(rotate_filter: str | None, enhance_color: bool) -> str | None:
+    filters: list[str] = []
+    if rotate_filter:
+        filters.append(rotate_filter)
+    if enhance_color:
+        filters.append(COLOR_ENHANCE_FILTER)
+    return ",".join(filters) if filters else None
+
+
+def build_output_dir_name(mode: str, timestamp: str | None = None) -> str:
+    if mode == "resize":
+        return f"rotated_resize{timestamp or ''}"
+    if timestamp:
+        return f"rotated_{mode}_{timestamp}"
+    return f"rotated_{mode}"
 
 
 def _resource_path(relative: str) -> Path:
@@ -211,14 +244,23 @@ def run_ffmpeg(
     src: Path,
     dst: Path,
     ffmpeg_bin: str,
-    rotate_filter: str,
+    video_filter: str | None,
     overwrite: bool,
     codec: str,
     preset: str,
     crf: str,
+    stop_event: threading.Event | None = None,
 ) -> JobResult:
     start = time.perf_counter()
     overwrite_flag = "-y" if overwrite else "-n"
+
+    def cleanup_partial_output() -> None:
+        try:
+            if dst.exists():
+                dst.unlink()
+        except OSError:
+            pass
+
     cmd = [
         ffmpeg_bin,
         "-hide_banner",
@@ -227,8 +269,10 @@ def run_ffmpeg(
         overwrite_flag,
         "-i",
         str(src),
-        "-vf",
-        rotate_filter,
+    ]
+    if video_filter:
+        cmd.extend(["-vf", video_filter])
+    cmd.extend([
         "-c:v",
         codec,
         "-preset",
@@ -238,16 +282,38 @@ def run_ffmpeg(
         "-c:a",
         "copy",
         str(dst),
-    ]
+    ])
 
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             cmd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            check=False,
             creationflags=_NO_WINDOW,
         )
+        stdout = ""
+        stderr = ""
+        while True:
+            try:
+                stdout, stderr = process.communicate(timeout=0.2)
+                break
+            except subprocess.TimeoutExpired:
+                if stop_event is not None and stop_event.is_set():
+                    process.terminate()
+                    try:
+                        stdout, stderr = process.communicate(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        stdout, stderr = process.communicate()
+                    cleanup_partial_output()
+                    return JobResult(
+                        source=src,
+                        output=dst,
+                        ok=False,
+                        elapsed=time.perf_counter() - start,
+                        error="Stopped by user",
+                    )
     except FileNotFoundError:
         return JobResult(
             source=src,
@@ -257,7 +323,7 @@ def run_ffmpeg(
             error="ffmpeg not found. Please install ffmpeg and add it to PATH.",
         )
 
-    if completed.returncode == 0:
+    if process.returncode == 0:
         return JobResult(
             source=src,
             output=dst,
@@ -270,11 +336,16 @@ def run_ffmpeg(
         output=dst,
         ok=False,
         elapsed=time.perf_counter() - start,
-        error=(completed.stderr or completed.stdout or "Unknown ffmpeg error").strip(),
+        error=(stderr or stdout or "Unknown ffmpeg error").strip(),
     )
 
 
-def process_videos(args: argparse.Namespace, log: LogFn, progress: ProgressFn | None = None) -> int:
+def process_videos(
+    args: argparse.Namespace,
+    log: LogFn,
+    progress: ProgressFn | None = None,
+    stop_event: threading.Event | None = None,
+) -> int:
     input_dir = args.input.expanduser().resolve()
     output_dir = args.output.expanduser().resolve()
     workers = max(1, args.workers)
@@ -303,37 +374,52 @@ def process_videos(args: argparse.Namespace, log: LogFn, progress: ProgressFn | 
     if progress is not None:
         progress(0, total)
 
+    if stop_event is not None and stop_event.is_set():
+        log("[INFO] Stopped before processing started.")
+        return 130
+
+    video_filter = build_video_filter(ROTATE_MAP[args.direction], bool(getattr(args, "enhance_color", False)))
+
     log("=== Video Rotate Batch ===")
     log(f"Input folder : {input_dir}")
     log(f"Output folder: {output_dir}")
     log(f"Direction    : {args.direction}")
+    log(f"Enhance color: {'yes' if getattr(args, 'enhance_color', False) else 'no'}")
     log(f"Videos found : {total}")
     log(f"Workers      : {workers}")
     log(f"ffmpeg       : {ffmpeg_bin}")
     log("==========================")
 
     jobs = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
+    stopped = False
+    done = 0
+    ok_count = 0
+    fail_count = 0
+    try:
         for src in videos:
+            if stop_event is not None and stop_event.is_set():
+                stopped = True
+                break
             dst = build_output_path(src, input_dir, output_dir, args.direction)
             future = executor.submit(
                 run_ffmpeg,
                 src,
                 dst,
                 ffmpeg_bin,
-                rotate_filter,
+                video_filter,
                 args.overwrite,
                 args.codec,
                 args.preset,
                 args.crf,
+                stop_event,
             )
             jobs.append(future)
 
-        done = 0
-        ok_count = 0
-        fail_count = 0
-
         for future in concurrent.futures.as_completed(jobs):
+            if stop_event is not None and stop_event.is_set():
+                stopped = True
+                executor.shutdown(wait=False, cancel_futures=True)
             result = future.result()
             done += 1
             if progress is not None:
@@ -352,6 +438,21 @@ def process_videos(args: argparse.Namespace, log: LogFn, progress: ProgressFn | 
                 )
                 if result.error:
                     log(f"           -> {result.error}")
+
+                if result.error == "Stopped by user":
+                    stopped = True
+                    break
+
+        if stop_event is not None and stop_event.is_set():
+            stopped = True
+    finally:
+        executor.shutdown(wait=not stopped, cancel_futures=stopped)
+
+    if stopped:
+        log("==========================")
+        log(f"Stopped. Success: {ok_count}, Failed: {fail_count}")
+        log(f"Output at: {output_dir}")
+        return 130
 
     log("==========================")
     log(f"Completed. Success: {ok_count}, Failed: {fail_count}")
@@ -430,13 +531,14 @@ def run_gui(args: argparse.Namespace) -> int:
 
     input_var = tk.StringVar(value=str(args.input) if args.input else "")
     direction_var = tk.StringVar(value=args.direction or "left")
+    enhance_color_var = tk.BooleanVar(value=bool(getattr(args, "enhance_color", False)))
 
     def computed_output_path() -> str:
         src = input_var.get().strip()
         if not src:
             return ""
         ts = time.strftime("%Y%m%d%H%M")
-        return str(Path(src) / f"rotated_{direction_var.get()}_{ts}")
+        return str(Path(src) / build_output_dir_name(direction_var.get(), ts))
 
     def browse_input() -> None:
         selected = filedialog.askdirectory(title="Select video folder")
@@ -461,13 +563,22 @@ def run_gui(args: argparse.Namespace) -> int:
     left_radio = ttk.Radiobutton(direction_buttons, text="หมุนซ้าย 90°", value="left", variable=direction_var)
     right_radio = ttk.Radiobutton(direction_buttons, text="หมุนขวา 90°", value="right", variable=direction_var)
     flip_radio = ttk.Radiobutton(direction_buttons, text="หมุน 180°", value="180", variable=direction_var)
+    resize_radio = ttk.Radiobutton(direction_buttons, text="ไม่หมุน / ย่อไฟล์", value="resize", variable=direction_var)
     left_radio.pack(side="left", padx=(0, 14))
     right_radio.pack(side="left", padx=(0, 14))
     flip_radio.pack(side="left")
+    resize_radio.pack(side="left", padx=(14, 0))
+
+    enhance_check = ttk.Checkbutton(
+        main,
+        text="ปรับสี / ลด highlight / เพิ่มสี / ยก shadow",
+        variable=enhance_color_var,
+    )
+    enhance_check.grid(row=4, column=0, sticky="w", pady=(8, 0))
 
     output_preview_var = tk.StringVar(value=f"Output: {computed_output_path()}")
     output_preview = ttk.Label(main, textvariable=output_preview_var, foreground="#2f6f44")
-    output_preview.grid(row=4, column=0, sticky="w", pady=(10, 0))
+    output_preview.grid(row=5, column=0, sticky="w", pady=(10, 0))
 
     controls_enabled = True
 
@@ -484,15 +595,15 @@ def run_gui(args: argparse.Namespace) -> int:
     input_var.trace_add("write", lambda *_: refresh_output_preview())
 
     progress_text = tk.StringVar(value="Ready")
-    ttk.Label(main, textvariable=progress_text).grid(row=5, column=0, sticky="w", pady=(12, 4))
+    ttk.Label(main, textvariable=progress_text).grid(row=6, column=0, sticky="w", pady=(12, 4))
     progress = ttk.Progressbar(main, mode="determinate")
-    progress.grid(row=6, column=0, sticky="ew", pady=(0, 8))
+    progress.grid(row=7, column=0, sticky="ew", pady=(0, 8))
 
     log_frame = ttk.LabelFrame(main, text="Log", padding=4)
-    log_frame.grid(row=7, column=0, sticky="nsew", pady=(4, 0))
+    log_frame.grid(row=8, column=0, sticky="nsew", pady=(4, 0))
     log_frame.columnconfigure(0, weight=1)
     log_frame.rowconfigure(0, weight=1)
-    main.rowconfigure(7, weight=1)
+    main.rowconfigure(8, weight=1)
     log_scroll = ttk.Scrollbar(log_frame, orient="vertical")
     log_scroll.grid(row=0, column=1, sticky="ns")
     log_box = tk.Text(log_frame, height=8, wrap="word", font=("Tahoma", 11), yscrollcommand=log_scroll.set, relief="flat", borderwidth=0)
@@ -500,9 +611,11 @@ def run_gui(args: argparse.Namespace) -> int:
     log_scroll.configure(command=log_box.yview)
 
     button_row = ttk.Frame(main)
-    button_row.grid(row=8, column=0, sticky="e", pady=(10, 0))
+    button_row.grid(row=9, column=0, sticky="e", pady=(10, 0))
     start_button = ttk.Button(button_row, text="▶  Start Rotation", width=20)
     start_button.pack(side="left", padx=8)
+    stop_button = ttk.Button(button_row, text="■  Stop", width=12)
+    stop_button.pack(side="left", padx=(0, 8))
 
     def open_output_folder() -> None:
         path = last_output_dir[0] or computed_output_path()
@@ -516,9 +629,9 @@ def run_gui(args: argparse.Namespace) -> int:
     close_button = ttk.Button(button_row, text="Close", command=root.destroy)
     close_button.pack(side="left")
 
-    ttk.Separator(main, orient="horizontal").grid(row=9, column=0, sticky="ew", pady=(4, 4))
+    ttk.Separator(main, orient="horizontal").grid(row=10, column=0, sticky="ew", pady=(4, 4))
     footer_frame = ttk.Frame(main)
-    footer_frame.grid(row=10, column=0, sticky="ew", pady=(0, 4))
+    footer_frame.grid(row=11, column=0, sticky="ew", pady=(0, 4))
     footer_frame.columnconfigure(0, weight=1)
     ttk.Label(
         footer_frame,
@@ -537,6 +650,7 @@ def run_gui(args: argparse.Namespace) -> int:
 
     events: queue.Queue[tuple] = queue.Queue()
     worker_thread: threading.Thread | None = None
+    stop_event = threading.Event()
 
     def append_log(message: str) -> None:
         log_box.insert("end", message + "\n")
@@ -552,11 +666,14 @@ def run_gui(args: argparse.Namespace) -> int:
             right_radio,
             left_radio,
             flip_radio,
+            resize_radio,
+            enhance_check,
             start_button,
             open_folder_btn,
             close_button,
         ):
             widget.configure(state=state)
+        stop_button.configure(state="disabled" if enabled else "normal")
 
     def pump_events() -> None:
         nonlocal worker_thread
@@ -583,6 +700,8 @@ def run_gui(args: argparse.Namespace) -> int:
                 if code == 0:
                     progress_text.set(f"Done ({elapsed_str})")
                     messagebox.showinfo("Completed", f"Video rotation completed.\nTotal time: {elapsed_str}")
+                elif code == 130:
+                    progress_text.set(f"Stopped ({elapsed_str})")
                 elif code == 2:
                     progress_text.set(f"Completed with errors ({elapsed_str})")
                     messagebox.showwarning("Completed with errors", f"Some videos failed to rotate.\nTotal time: {elapsed_str}")
@@ -619,12 +738,14 @@ def run_gui(args: argparse.Namespace) -> int:
             preset=preset,
             crf=crf,
             ffmpeg=args.ffmpeg,
+            enhance_color=enhance_color_var.get(),
         )
 
         log_box.delete("1.0", "end")
         progress["value"] = 0
         progress["maximum"] = 1
         progress_text.set("Starting...")
+        stop_event.clear()
         set_controls(False)
 
         _start_time = time.perf_counter()
@@ -634,12 +755,20 @@ def run_gui(args: argparse.Namespace) -> int:
                 run_args,
                 log=lambda msg: events.put(("log", msg)),
                 progress=lambda done, total: events.put(("progress", done, total)),
+                stop_event=stop_event,
             )
             events.put(("done", exit_code, time.perf_counter() - _start_time))
 
         worker_thread = threading.Thread(target=worker, daemon=True)
         worker_thread.start()
         root.after(120, pump_events)
+
+    def stop_rotation() -> None:
+        if worker_thread is None or not worker_thread.is_alive():
+            return
+        stop_event.set()
+        progress_text.set("Stopping...")
+        append_log("[INFO] Stop requested by user.")
 
     def _check_ffmpeg_on_start() -> None:
         if resolve_ffmpeg(args.ffmpeg) is not None:
@@ -718,6 +847,7 @@ def run_gui(args: argparse.Namespace) -> int:
         root.after(300, _poll_install)
 
     start_button.configure(command=start_rotation)
+    stop_button.configure(command=stop_rotation, state="disabled")
     get_quality_settings()
     refresh_output_preview()
     root.after(400, _check_ffmpeg_on_start)

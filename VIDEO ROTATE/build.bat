@@ -2,11 +2,11 @@
 setlocal EnableDelayedExpansion
 chcp 65001 >nul
 
-set "VERSION=1.0.0"
-set "EXE_NAME=VideoRotate-RUNNING.IN.TH-v%VERSION%"
+set "VERSION=1.1.0"
+set "EXE_NAME=VIDEO-TOOLS-RUNNING.IN.TH-v%VERSION%"
 
 echo ============================================
-echo   Build: VideoRotate - RUNNING.IN.TH v%VERSION%
+echo   Build: VIDEO-TOOLS - RUNNING.IN.TH v%VERSION%
 echo ============================================
 echo.
 
