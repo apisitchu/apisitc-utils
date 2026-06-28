@@ -14,6 +14,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, List
 
+# Suppress console window when calling subprocesses from a windowed .exe on Windows
+_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
 
 VIDEO_EXTENSIONS = {
     ".mp4",
@@ -156,11 +159,18 @@ def list_videos(input_dir: Path, recursive: bool) -> List[Path]:
     )
 
 
-def build_output_path(src: Path, input_dir: Path, output_dir: Path) -> Path:
+def build_output_path(src: Path, input_dir: Path, output_dir: Path, direction: str) -> Path:
     relative_path = src.relative_to(input_dir)
-    output_path = output_dir / relative_path
+    new_name = f"{relative_path.stem}_rotation_{direction}{relative_path.suffix}"
+    output_path = output_dir / relative_path.parent / new_name
     output_path.parent.mkdir(parents=True, exist_ok=True)
     return output_path
+
+
+def _resource_path(relative: str) -> Path:
+    """Resolve path to a bundled resource (works both in dev and PyInstaller .exe)."""
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+    return base / relative
 
 
 def resolve_ffmpeg(ffmpeg_arg: Path | None) -> str | None:
@@ -236,6 +246,7 @@ def run_ffmpeg(
             capture_output=True,
             text=True,
             check=False,
+            creationflags=_NO_WINDOW,
         )
     except FileNotFoundError:
         return JobResult(
@@ -304,7 +315,7 @@ def process_videos(args: argparse.Namespace, log: LogFn, progress: ProgressFn | 
     jobs = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
         for src in videos:
-            dst = build_output_path(src, input_dir, output_dir)
+            dst = build_output_path(src, input_dir, output_dir, args.direction)
             future = executor.submit(
                 run_ffmpeg,
                 src,
@@ -357,43 +368,75 @@ def run_gui(args: argparse.Namespace) -> int:
         return 1
 
     root = tk.Tk()
-    root.title("Video Rotate Batch")
-    root.geometry("820x560")
-    root.minsize(740, 520)
+    root.title("RUNNING.IN.TH VIDEOS ROTATE")
+    _ico_path = _resource_path("favicon.ico")
+    if _ico_path.exists():
+        root.iconbitmap(str(_ico_path))
+    root.geometry("880x660")
+    root.minsize(760, 580)
 
     style = ttk.Style()
     for theme in ("vista", "clam"):
         if theme in style.theme_names():
             style.theme_use(theme)
             break
+    BG = "#f7f7f7"
+    ACCENT = "#e30613"
+    style.configure(".", font=("Tahoma", 12), background=BG)
+    style.configure("TFrame", background=BG)
+    style.configure("TLabel", background=BG)
+    style.configure("TRadiobutton", background=BG)
+    style.configure("TCheckbutton", background=BG)
+    style.configure("TLabelframe", background=BG, borderwidth=1)
+    style.configure("TLabelframe.Label", background=BG, foreground="#333333", font=("Tahoma", 12))
+    style.configure("TProgressbar", troughcolor="#ddd", background=ACCENT)
+    root.configure(bg=BG)
 
-    main = ttk.Frame(root, padding=18)
+    main = ttk.Frame(root, padding=(16, 12))
     main.pack(fill="both", expand=True)
     main.columnconfigure(0, weight=1)
 
-    title = ttk.Label(main, text="Rotate Videos", font=("Segoe UI", 15, "bold"))
-    title.grid(row=0, column=0, sticky="w")
-    subtitle = ttk.Label(
-        main,
-        text="เลือกโฟลเดอร์วิดีโอ เลือกทิศทาง แล้วกดเริ่มได้เลย",
-    )
-    subtitle.grid(row=1, column=0, sticky="w", pady=(2, 14))
+    # Load logo
+    _logo_img_ref = None
+    try:
+        from PIL import Image, ImageTk
+        _logo_path = _resource_path("logo.png")
+        if _logo_path.exists():
+            _pil = Image.open(_logo_path)
+            _pil.thumbnail((100, 50), Image.LANCZOS)
+            _logo_img_ref = ImageTk.PhotoImage(_pil)
+    except Exception:
+        try:
+            _logo_path = _resource_path("logo.png")
+            if _logo_path.exists():
+                _tk_img = tk.PhotoImage(file=str(_logo_path))
+                _w, _h = _tk_img.width(), _tk_img.height()
+                _factor = max(1, _h // 50)
+                _logo_img_ref = _tk_img.subsample(_factor, _factor)
+        except Exception:
+            pass
+
+    # Header: logo top-left, title/subtitle on the right
+    header = ttk.Frame(main)
+    header.grid(row=0, column=0, sticky="ew", pady=(0, 0))
+    header.columnconfigure(1, weight=1)
+
+    if _logo_img_ref is not None:
+        logo_lbl = ttk.Label(header, image=_logo_img_ref)
+        logo_lbl.image = _logo_img_ref
+        logo_lbl.grid(row=0, column=0, sticky="nw")
+
+    tk.Frame(main, bg="#e30613", height=3).grid(row=1, column=0, sticky="ew", pady=(4, 10))
 
     input_var = tk.StringVar(value=str(args.input) if args.input else "")
-    direction_var = tk.StringVar(value=args.direction or "right")
-    quality_var = tk.StringVar(value="balanced")
-    recursive_var = tk.BooleanVar(value=bool(args.recursive))
-    output_var = tk.StringVar(value=str(args.output) if args.output else "")
-    use_custom_output_var = tk.BooleanVar(value=bool(args.output))
-    workers_var = tk.IntVar(value=max(1, args.workers))
-    overwrite_var = tk.BooleanVar(value=bool(args.overwrite))
-    show_advanced_var = tk.BooleanVar(value=False)
+    direction_var = tk.StringVar(value=args.direction or "left")
 
     def computed_output_path() -> str:
         src = input_var.get().strip()
         if not src:
             return ""
-        return str(Path(src) / f"rotated_{direction_var.get()}")
+        ts = time.strftime("%Y%m%d%H%M")
+        return str(Path(src) / f"rotated_{direction_var.get()}_{ts}")
 
     def browse_input() -> None:
         selected = filedialog.askdirectory(title="Select video folder")
@@ -401,153 +444,96 @@ def run_gui(args: argparse.Namespace) -> int:
             input_var.set(selected)
             refresh_output_preview()
 
-    def browse_output() -> None:
-        selected = filedialog.askdirectory(title="Select output folder")
-        if selected:
-            output_var.set(selected)
+    top_card = ttk.LabelFrame(main, text="โฟลเดอร์วิดีโอ", padding=10)
+    top_card.grid(row=2, column=0, sticky="ew", pady=(0, 6))
+    top_card.columnconfigure(0, weight=1)
 
-    top_card = ttk.Frame(main, padding=14)
-    top_card.grid(row=2, column=0, sticky="ew")
-    top_card.columnconfigure(1, weight=1)
-
-    ttk.Label(top_card, text="โฟลเดอร์วิดีโอ").grid(row=0, column=0, sticky="w")
     input_entry = ttk.Entry(top_card, textvariable=input_var)
-    input_entry.grid(row=1, column=0, columnspan=2, sticky="ew", padx=(0, 8), pady=(4, 0))
+    input_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
     browse_input_btn = ttk.Button(top_card, text="Browse", command=browse_input)
-    browse_input_btn.grid(row=1, column=2, sticky="ew", pady=(4, 0))
+    browse_input_btn.grid(row=0, column=1, sticky="ew")
 
-    direction_card = ttk.Frame(main, padding=(14, 10))
-    direction_card.grid(row=3, column=0, sticky="ew", pady=(10, 0))
-    ttk.Label(direction_card, text="ทิศทางการหมุน").pack(anchor="w")
+    direction_card = ttk.LabelFrame(main, text="ทิศทางการหมุน", padding=10)
+    direction_card.grid(row=3, column=0, sticky="ew", pady=(0, 6))
 
     direction_buttons = ttk.Frame(direction_card)
-    direction_buttons.pack(anchor="w", pady=(6, 0))
-    right_radio = ttk.Radiobutton(direction_buttons, text="หมุนขวา 90°", value="right", variable=direction_var)
+    direction_buttons.pack(anchor="w")
     left_radio = ttk.Radiobutton(direction_buttons, text="หมุนซ้าย 90°", value="left", variable=direction_var)
+    right_radio = ttk.Radiobutton(direction_buttons, text="หมุนขวา 90°", value="right", variable=direction_var)
     flip_radio = ttk.Radiobutton(direction_buttons, text="หมุน 180°", value="180", variable=direction_var)
-    right_radio.pack(side="left", padx=(0, 14))
     left_radio.pack(side="left", padx=(0, 14))
+    right_radio.pack(side="left", padx=(0, 14))
     flip_radio.pack(side="left")
-
-    quality_card = ttk.Frame(main, padding=(14, 10))
-    quality_card.grid(row=4, column=0, sticky="ew", pady=(10, 0))
-    ttk.Label(quality_card, text="คุณภาพวิดีโอ").pack(anchor="w")
-    quality_box = ttk.Combobox(
-        quality_card,
-        textvariable=quality_var,
-        values=("high", "balanced", "small"),
-        state="readonly",
-        width=18,
-    )
-    quality_box.pack(anchor="w", pady=(6, 0))
-    quality_hint_var = tk.StringVar(
-        value="Balanced: คุณภาพดีและไฟล์ไม่ใหญ่เกินไป"
-    )
-    ttk.Label(quality_card, textvariable=quality_hint_var).pack(anchor="w", pady=(4, 0))
-
-    quick_options = ttk.Frame(main)
-    quick_options.grid(row=5, column=0, sticky="w", pady=(10, 0))
-    recursive_check = ttk.Checkbutton(quick_options, text="รวมโฟลเดอร์ย่อย", variable=recursive_var)
-    recursive_check.pack(side="left")
 
     output_preview_var = tk.StringVar(value=f"Output: {computed_output_path()}")
     output_preview = ttk.Label(main, textvariable=output_preview_var, foreground="#2f6f44")
-    output_preview.grid(row=6, column=0, sticky="w", pady=(10, 0))
-
-    advanced_toggle = ttk.Checkbutton(
-        main,
-        text="ตั้งค่าขั้นสูง",
-        variable=show_advanced_var,
-        command=lambda: advanced_frame.grid() if show_advanced_var.get() else advanced_frame.grid_remove(),
-    )
-    advanced_toggle.grid(row=7, column=0, sticky="w", pady=(10, 0))
-
-    advanced_frame = ttk.Frame(main, padding=(12, 10))
-    advanced_frame.grid(row=8, column=0, sticky="ew", pady=(6, 0))
-    advanced_frame.columnconfigure(1, weight=1)
-    advanced_frame.grid_remove()
-
-    custom_output_check = ttk.Checkbutton(
-        advanced_frame,
-        text="เลือกโฟลเดอร์ปลายทางเอง",
-        variable=use_custom_output_var,
-        command=lambda: None,
-    )
-    custom_output_check.grid(row=0, column=0, columnspan=3, sticky="w")
-
-    ttk.Entry(advanced_frame, textvariable=output_var).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0), padx=(0, 8))
-    browse_output_btn = ttk.Button(advanced_frame, text="Browse", command=browse_output)
-    browse_output_btn.grid(row=1, column=2, sticky="ew", pady=(6, 0))
-
-    ttk.Label(advanced_frame, text="Workers").grid(row=2, column=0, sticky="w", pady=(8, 0))
-    workers_spin = ttk.Spinbox(
-        advanced_frame,
-        from_=1,
-        to=max(64, (os.cpu_count() or 8) * 2),
-        textvariable=workers_var,
-        width=8,
-    )
-    workers_spin.grid(row=2, column=1, sticky="w", pady=(8, 0))
-    overwrite_check = ttk.Checkbutton(advanced_frame, text="เขียนทับไฟล์เดิม", variable=overwrite_var)
-    overwrite_check.grid(row=2, column=2, sticky="e", pady=(8, 0))
+    output_preview.grid(row=4, column=0, sticky="w", pady=(10, 0))
 
     controls_enabled = True
 
     def get_quality_settings() -> tuple[str, str, str]:
-        profile = quality_var.get()
-        if profile == "high":
-            quality_hint_var.set("High: คุณภาพสูงกว่าเดิม ไฟล์ใหญ่ขึ้น")
-            return ("libx264", "slow", "18")
-        if profile == "small":
-            quality_hint_var.set("Small: ไฟล์เล็กลง เร็วขึ้น แต่คุณภาพลดลง")
-            return ("libx264", "veryfast", "27")
-        quality_hint_var.set("Balanced: คุณภาพดีและไฟล์ไม่ใหญ่เกินไป")
         return ("libx264", "veryfast", "23")
-
-    def update_advanced_state() -> None:
-        output_state = "normal" if (controls_enabled and use_custom_output_var.get()) else "disabled"
-        for widget in (browse_output_btn,):
-            widget.configure(state=output_state)
-        for child in advanced_frame.winfo_children():
-            if isinstance(child, ttk.Entry):
-                child.configure(state=output_state)
-
-    update_advanced_state()
-    custom_output_check.configure(
-        command=lambda: (update_advanced_state(), refresh_output_preview())
-    )
 
     def on_direction_change(*_args: object) -> None:
         refresh_output_preview()
 
     def refresh_output_preview() -> None:
-        auto_path = computed_output_path()
-        if not use_custom_output_var.get():
-            output_preview_var.set(f"Output: {auto_path}")
-        else:
-            custom = output_var.get().strip()
-            output_preview_var.set(f"Output: {custom or auto_path}")
+        output_preview_var.set(f"Output: {computed_output_path()}")
 
     direction_var.trace_add("write", on_direction_change)
     input_var.trace_add("write", lambda *_: refresh_output_preview())
-    output_var.trace_add("write", lambda *_: refresh_output_preview())
-    quality_var.trace_add("write", lambda *_: get_quality_settings())
 
     progress_text = tk.StringVar(value="Ready")
-    ttk.Label(main, textvariable=progress_text).grid(row=9, column=0, sticky="w", pady=(12, 4))
+    ttk.Label(main, textvariable=progress_text).grid(row=5, column=0, sticky="w", pady=(12, 4))
     progress = ttk.Progressbar(main, mode="determinate")
-    progress.grid(row=10, column=0, sticky="ew", pady=(0, 8))
+    progress.grid(row=6, column=0, sticky="ew", pady=(0, 8))
 
-    log_box = tk.Text(main, height=10, wrap="word")
-    log_box.grid(row=11, column=0, sticky="nsew")
-    main.rowconfigure(11, weight=1)
+    log_frame = ttk.LabelFrame(main, text="Log", padding=4)
+    log_frame.grid(row=7, column=0, sticky="nsew", pady=(4, 0))
+    log_frame.columnconfigure(0, weight=1)
+    log_frame.rowconfigure(0, weight=1)
+    main.rowconfigure(7, weight=1)
+    log_scroll = ttk.Scrollbar(log_frame, orient="vertical")
+    log_scroll.grid(row=0, column=1, sticky="ns")
+    log_box = tk.Text(log_frame, height=8, wrap="word", font=("Tahoma", 11), yscrollcommand=log_scroll.set, relief="flat", borderwidth=0)
+    log_box.grid(row=0, column=0, sticky="nsew")
+    log_scroll.configure(command=log_box.yview)
 
     button_row = ttk.Frame(main)
-    button_row.grid(row=12, column=0, sticky="e", pady=(10, 0))
-    start_button = ttk.Button(button_row, text="Start Rotation", width=18)
+    button_row.grid(row=8, column=0, sticky="e", pady=(10, 0))
+    start_button = ttk.Button(button_row, text="▶  Start Rotation", width=20)
     start_button.pack(side="left", padx=8)
+
+    def open_output_folder() -> None:
+        path = last_output_dir[0] or computed_output_path()
+        if path and Path(path).exists():
+            os.startfile(path)
+        else:
+            messagebox.showinfo("Output Folder", f"Folder not found:\n{path}")
+
+    open_folder_btn = ttk.Button(button_row, text="Open Output Folder", command=open_output_folder)
+    open_folder_btn.pack(side="left", padx=(0, 8))
     close_button = ttk.Button(button_row, text="Close", command=root.destroy)
     close_button.pack(side="left")
+
+    ttk.Separator(main, orient="horizontal").grid(row=9, column=0, sticky="ew", pady=(4, 4))
+    footer_frame = ttk.Frame(main)
+    footer_frame.grid(row=10, column=0, sticky="ew", pady=(0, 4))
+    footer_frame.columnconfigure(0, weight=1)
+    ttk.Label(
+        footer_frame,
+        text="Copyright 2026 © running.in.th  |  ishootrun.in.th  |  sportaction.photos  |  eventrunning.photos",
+        font=("Tahoma", 12),
+        foreground="#5c5c5c",
+    ).grid(row=0, column=0, sticky="w")
+    ttk.Label(
+        footer_frame,
+        text="v1.0.0",
+        font=("Tahoma", 11),
+        foreground="#5c5c5c",
+    ).grid(row=0, column=1, sticky="e")
+
+    last_output_dir: list[str] = [""]
 
     events: queue.Queue[tuple] = queue.Queue()
     worker_thread: threading.Thread | None = None
@@ -566,18 +552,11 @@ def run_gui(args: argparse.Namespace) -> int:
             right_radio,
             left_radio,
             flip_radio,
-            quality_box,
-            recursive_check,
-            advanced_toggle,
-            custom_output_check,
-            workers_spin,
-            overwrite_check,
-            browse_output_btn,
             start_button,
+            open_folder_btn,
             close_button,
         ):
             widget.configure(state=state)
-        update_advanced_state()
 
     def pump_events() -> None:
         nonlocal worker_thread
@@ -597,13 +576,16 @@ def run_gui(args: argparse.Namespace) -> int:
                 progress_text.set(f"Progress: {done}/{total}")
             elif kind == "done":
                 code = event[1]
+                elapsed = event[2] if len(event) > 2 else 0.0
+                mins, secs = divmod(int(elapsed), 60)
+                elapsed_str = f"{mins}m {secs}s" if mins else f"{secs}s"
                 set_controls(True)
                 if code == 0:
-                    progress_text.set("Done")
-                    messagebox.showinfo("Completed", "Video rotation completed.")
+                    progress_text.set(f"Done ({elapsed_str})")
+                    messagebox.showinfo("Completed", f"Video rotation completed.\nTotal time: {elapsed_str}")
                 elif code == 2:
-                    progress_text.set("Completed with errors")
-                    messagebox.showwarning("Completed with errors", "Some videos failed to rotate.")
+                    progress_text.set(f"Completed with errors ({elapsed_str})")
+                    messagebox.showwarning("Completed with errors", f"Some videos failed to rotate.\nTotal time: {elapsed_str}")
                 else:
                     progress_text.set("Failed")
                     messagebox.showerror("Failed", "Rotation could not be started.")
@@ -618,24 +600,21 @@ def run_gui(args: argparse.Namespace) -> int:
             return
 
         input_dir = input_var.get().strip().strip('"')
-        output_dir = output_var.get().strip().strip('"')
         if not input_dir:
             messagebox.showerror("Missing input", "Please select an input folder.")
             return
 
-        if not use_custom_output_var.get() or not output_dir:
-            output_dir = computed_output_path()
-            output_var.set(output_dir)
-
+        output_dir = computed_output_path()
+        last_output_dir[0] = output_dir
         codec, preset, crf = get_quality_settings()
 
         run_args = argparse.Namespace(
             input=Path(input_dir),
             output=Path(output_dir),
             direction=direction_var.get(),
-            workers=max(1, int(workers_var.get())),
-            recursive=bool(recursive_var.get()),
-            overwrite=bool(overwrite_var.get()),
+            workers=2,
+            recursive=False,
+            overwrite=False,
             codec=codec,
             preset=preset,
             crf=crf,
@@ -648,21 +627,100 @@ def run_gui(args: argparse.Namespace) -> int:
         progress_text.set("Starting...")
         set_controls(False)
 
+        _start_time = time.perf_counter()
+
         def worker() -> None:
             exit_code = process_videos(
                 run_args,
                 log=lambda msg: events.put(("log", msg)),
                 progress=lambda done, total: events.put(("progress", done, total)),
             )
-            events.put(("done", exit_code))
+            events.put(("done", exit_code, time.perf_counter() - _start_time))
 
         worker_thread = threading.Thread(target=worker, daemon=True)
         worker_thread.start()
         root.after(120, pump_events)
 
+    def _check_ffmpeg_on_start() -> None:
+        if resolve_ffmpeg(args.ffmpeg) is not None:
+            return
+
+        answer = messagebox.askyesno(
+            "ไม่พบ ffmpeg",
+            "ไม่พบ ffmpeg ในระบบ\n\n"
+            "ต้องการติดตั้ง ffmpeg อัตโนมัติผ่าน winget หรือไม่?\n"
+            "(ใช้เวลาประมาณ 1-2 นาที)\n\n"
+            "หากกด No สามารถดาวน์โหลดเองได้ที่:\n"
+            "https://www.gyan.dev/ffmpeg/builds/",
+            icon="warning",
+        )
+        if not answer:
+            return
+
+        set_controls(False)
+        append_log("[INFO] กำลังติดตั้ง ffmpeg ผ่าน winget...")
+        progress_text.set("Installing ffmpeg...")
+
+        _install_done: list[bool] = [False]
+        _install_ok: list[bool] = [False]
+        _install_log: queue.Queue[str] = queue.Queue()
+
+        def _install_worker() -> None:
+            try:
+                proc = subprocess.run(
+                    [
+                        "winget", "install",
+                        "--id", "Gyan.FFmpeg",
+                        "-e",
+                        "--accept-source-agreements",
+                        "--accept-package-agreements",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    creationflags=_NO_WINDOW,
+                )
+                if proc.returncode == 0:
+                    _install_log.put("[OK] ติดตั้ง ffmpeg สำเร็จแล้ว!")
+                    _install_log.put("[INFO] กรุณาปิดแล้วเปิดโปรแกรมใหม่เพื่อใช้งาน")
+                    _install_ok[0] = True
+                else:
+                    out = (proc.stdout or proc.stderr or "Unknown error").strip()
+                    _install_log.put(f"[ERROR] ติดตั้งไม่สำเร็จ: {out}")
+            except FileNotFoundError:
+                _install_log.put("[ERROR] ไม่พบ winget ในระบบ")
+                _install_log.put("[INFO] ดาวน์โหลด ffmpeg เอง: https://www.gyan.dev/ffmpeg/builds/")
+            finally:
+                _install_done[0] = True
+
+        threading.Thread(target=_install_worker, daemon=True).start()
+
+        def _poll_install() -> None:
+            while True:
+                try:
+                    msg = _install_log.get_nowait()
+                    append_log(msg)
+                except queue.Empty:
+                    break
+            if not _install_done[0]:
+                root.after(300, _poll_install)
+                return
+            set_controls(True)
+            if _install_ok[0]:
+                progress_text.set("ffmpeg installed — Please restart")
+                messagebox.showinfo(
+                    "ติดตั้งสำเร็จ",
+                    "ติดตั้ง ffmpeg สำเร็จแล้ว\nกรุณาปิดและเปิดโปรแกรมใหม่เพื่อใช้งาน",
+                )
+            else:
+                progress_text.set("ffmpeg not found")
+
+        root.after(300, _poll_install)
+
     start_button.configure(command=start_rotation)
     get_quality_settings()
     refresh_output_preview()
+    root.after(400, _check_ffmpeg_on_start)
     root.mainloop()
     return 0
 
